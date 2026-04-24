@@ -1,0 +1,9 @@
+{
+  "dependencies": {
+    "colors": "^1.4.0",
+    "commander": "^13.1.0",
+    "hpack": "^1.0.0",
+    "https": "^1.0.0",
+    "socks": "^2.8.4"
+  }
+}
